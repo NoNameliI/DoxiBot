@@ -1,4 +1,4 @@
-"""Анализ DOCX на соответствие требованиям оформления ККСО-XX-24.
+"""Анализ DOCX на соответствие стандартным требованиям к оформлению.
 
 Документ разбирается на блоки (абзацы и таблицы), каждый блок классифицируется (заголовок, рисунок,
 подпись, формула, перечисление, основной текст…), после чего к нему применяются свои правила.
@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -20,14 +20,16 @@ from docx.shared import Cm, Mm
 from . import fixes as F
 from . import rules as R
 from .model import Analysis, Issue
+from .profile import DEFAULT, Profile
 from .ooxml import (
-    _SYMBOL_CHARS, M_OMATHPARA, W_FLDCHAR, W_FLDSIMPLE, W_INSTR, W_P, W_SDT, W_TBL, WP_ANCHOR, Resolver, _is_excluded,
+    _SYMBOL_CHARS, M_OMATHPARA, W_FLDCHAR, W_FLDSIMPLE, W_INSTR, W_P, W_SDT, W_T, W_TBL, WP_ANCHOR, Resolver, _is_excluded,
     clark, cm, has_math, has_picture, inline_from_anchor, iter_paragraphs, map_text_nodes, math_text,
     num_ru, paragraph_runs, paragraph_text, replace_span, set_lvl_child, shorten, text_runs,
 )
 
 TOL = R.INDENT_TOLERANCE_TWIPS
-INDENT = R.FIRST_LINE_INDENT_TWIPS
+LAST_RENDERED = qn("w:lastRenderedPageBreak")
+W_BR = qn("w:br")
 
 ALIGN_RU = {"both": "по ширине", "center": "по центру", "left": "по левому краю", "right": "по правому краю"}
 CAPTION_WORD = {"fig": "Рисунок", "tbl": "Таблица", "lst": "Листинг"}
@@ -41,7 +43,7 @@ CAPTION_RE = re.compile(
 )
 VALID_NUM = re.compile(r"^(?:\d+|[А-ЯЁA-Z])\.\d+$")
 CONT_RE = re.compile(r"^\s*продолжение\s+таблицы\b", re.I)
-CONT_FULL = re.compile(r"^Продолжение таблицы (?:\d+|[А-ЯЁA-Z])\.\d+$")
+CONT_FULL = re.compile(r"^Продолжение таблицы ((?:\d+|[А-ЯЁA-Z])(?:\.\d+)*)$")
 FORMULA_NUM_RE = re.compile(r"\(\s*((?:\d+|[А-ЯЁA-Z])(?:\.\d+)*)\s*\)")
 NUM_HEADING_RE = re.compile(r"^(?P<num>\d{1,2}(?:\.\d{1,2}){0,3})(?P<dot>\.?)\s+(?P<title>\S.*)$", re.S)
 GLAVA_RE = re.compile(r"^глава\s+(?P<num>\d+)\.?\s*(?P<title>.*)$", re.I | re.S)
@@ -95,14 +97,19 @@ class Block:
 
 
 class Analyzer:
-    def __init__(self, document: DocxDocument):
+    def __init__(self, document: DocxDocument, profile: Profile = DEFAULT, title_pages: int | None = None):
         self.doc = document
+        self.p = profile
+        self.indent = profile.indent_twips
+        self.title_pages = profile.title_pages if title_pages is None else title_pages
         self.res = Resolver(document)
         self.blocks: list[Block] = []
-        self.analysis = Analysis()
+        self.analysis = Analysis(profile=profile)
         self.has_toc_field = False
         self._fields: list[dict] = []
         self._section_no = 0
+        self._page = 1
+        self._seen_text = True
         self.renumber: dict[str, dict[str, str]] = {"fig": {}, "tbl": {}}
         self.renumber_conflicts: dict[str, set[str]] = {"fig": set(), "tbl": set()}
         self.table_profiles: list[tuple[Block, tuple[float, float]]] = []
@@ -130,6 +137,9 @@ class Analyzer:
     # ================================================================== issues
     def add(self, code: str, b: Block | None, detail: str = "", fix: Callable | None = None,
             where: str | None = None, anchor=None) -> None:
+        group = R.RULES[code].group
+        if group and not getattr(self.p, group, True):
+            return
         if anchor is None and b is not None:
             anchor = b.el if b.kind == "p" else next(iter_paragraphs(b.el), None)
         self.analysis.issues.append(
@@ -167,13 +177,22 @@ class Analyzer:
         tag = el.tag
         if tag == W_P:
             toc = self._scan_fields(el) or in_toc
-            self.blocks.append(Block(len(self.blocks), "p", el, in_toc=toc, extra={"sect": self._section_no}))
+            self.blocks.append(Block(len(self.blocks), "p", el, in_toc=toc,
+                                     extra={"sect": self._section_no, "page": self._page}))
+            breaks = self._page_breaks(el)
             ppr = el.find(qn("w:pPr"))
-            if ppr is not None and ppr.find(qn("w:sectPr")) is not None:
+            sect = ppr.find(qn("w:sectPr")) if ppr is not None else None
+            if sect is not None:
                 self._section_no += 1
+                kind = sect.find(qn("w:type"))
+                if (kind is None or kind.get(qn("w:val")) in ("nextPage", "oddPage", "evenPage")) and not breaks:
+                    breaks = 1
+            self._page += breaks
         elif tag == W_TBL:
             self._scan_fields(el)
-            self.blocks.append(Block(len(self.blocks), "tbl", el, extra={"sect": self._section_no}))
+            self.blocks.append(Block(len(self.blocks), "tbl", el,
+                                     extra={"sect": self._section_no, "page": self._page}))
+            self._page += self._page_breaks(el)
         elif tag in (W_SDT, qn("w:customXml")):
             content = el
             is_toc = False
@@ -184,6 +203,25 @@ class Analyzer:
             if content is not None:
                 for child in content:
                     self._walk(child, in_toc or is_toc)
+
+    def _page_breaks(self, el) -> int:
+        """Сколько страниц начинается внутри блока: явные разрывы и разметка Word (lastRenderedPageBreak).
+
+        Два маркера подряд без текста между ними — один и тот же разрыв.
+        """
+        count = 0
+        for node in el.iter(W_T, W_BR, LAST_RENDERED):
+            if node.tag == W_T:
+                if (node.text or "").strip():
+                    self._seen_text = True
+            elif node.tag == W_BR:
+                if node.get(qn("w:type")) == "page" and self._seen_text:
+                    count += 1
+                    self._seen_text = False
+            elif self._seen_text:
+                count += 1
+                self._seen_text = False
+        return count
 
     def _scan_fields(self, el) -> bool:
         stack = self._fields
@@ -288,6 +326,20 @@ class Analyzer:
         return len(rest) <= 2
 
     def _mark_front(self) -> None:
+        if self.title_pages is not None and self.title_pages >= 0:
+            if self.title_pages == 0:
+                return
+            pages = max((b.extra.get("page", 1) for b in self.blocks), default=1)
+            if pages > self.title_pages:
+                for b in self.blocks:
+                    if b.extra.get("page", 1) <= self.title_pages:
+                        b.extra["orig"] = b.ptype
+                        b.ptype = "FRONT"
+                return
+            self.analysis.notes.append(
+                "Границы страниц в файле не размечены — титульный лист определён автоматически, "
+                "по первому разделу отчёта."
+            )
         headings = [b for b in self.blocks if b.ptype == "HEADING"]
         # Бланк задания содержит «1. ЦЕЛЕВАЯ УСТАНОВКА» и т.п. — неоформленные «заголовки» не считаем началом отчёта.
         known = [b for b in headings if b.heading[0] in ("toc", "structural", "appendix") or b.heading[2]]
@@ -465,9 +517,11 @@ class Analyzer:
             self._check_floating_pictures(b)
 
     # ================================================================== общие проверки
-    def _check_runs(self, b: Block, allow_bold: bool = False, size: float | None = R.FONT_SIZE_PT,
+    def _check_runs(self, b: Block, allow_bold: bool = False, size: float | None = -1.0,
                     font_code: str = "font_name") -> None:
         p, res = b.el, self.res
+        if size == -1.0:
+            size = self.p.font_size
         runs = text_runs(p)
         if not runs:
             return
@@ -475,7 +529,7 @@ class Analyzer:
         bad_font = bad_size = bad_color = bad_u = bad_b = False
         for r in runs:
             name = res.font_name(r, p)
-            if name.strip().lower() != R.FONT_NAME.lower():
+            if name.strip().lower() != self.p.font_name.lower():
                 fonts.add(name)
                 bad_font = True
             if size is not None:
@@ -493,7 +547,8 @@ class Analyzer:
                 bad_b = True
         all_runs = paragraph_runs(p)
         if bad_font:
-            self.add(font_code, b, ", ".join(sorted(fonts)), fix=lambda: F.set_font_name(all_runs))
+            self.add(font_code, b, ", ".join(sorted(fonts)),
+                     fix=lambda: F.set_font_name(all_runs, self.p.font_name))
         if bad_size:
             self.add("font_size", b, ", ".join(f"{num_ru(s)} пт" for s in sorted(sizes)),
                      fix=lambda: F.set_font_size(all_runs, size))
@@ -523,12 +578,17 @@ class Analyzer:
             self.add(indent_code, b, f"{', '.join(parts)}; нужно {cm(first) if first else 'без отступа'}",
                      fix=lambda: F.set_indent(p, first, 0, 0))
 
-    def _check_spacing(self, b: Block, line: float | None = R.LINE_SPACING) -> None:
+    def _check_spacing(self, b: Block, line: float | None = -1.0) -> None:
         p = b.el
+        if line == -1.0:
+            line = self.p.line_spacing
         before, after, value, rule = self.res.spacing(p)
-        if before > 0 or after > 0:
-            self.add("spacing_body", b, f"перед {num_ru(before / 20)} пт, после {num_ru(after / 20)} пт",
-                     fix=lambda: F.set_spacing_zero(p))
+        want_before, want_after = round(self.p.space_before_pt * 20), round(self.p.space_after_pt * 20)
+        if abs(before - want_before) > 5 or abs(after - want_after) > 5:
+            self.add("spacing_body", b,
+                     f"перед {num_ru(before / 20)} пт, после {num_ru(after / 20)} пт; "
+                     f"нужно {num_ru(self.p.space_before_pt)}/{num_ru(self.p.space_after_pt)} пт",
+                     fix=lambda: F.set_spacing(p, self.p.space_before_pt, self.p.space_after_pt))
         if line is not None and (rule != "auto" or abs(value - line) > 0.02):
             cur = num_ru(round(value, 2)) if rule == "auto" else f"{'точно' if rule == 'exact' else 'минимум'} {num_ru(value)} пт"
             self.add("line_spacing_body", b, f"сейчас {cur}", fix=lambda: F.set_line_spacing(p, line))
@@ -544,10 +604,12 @@ class Analyzer:
 
     # ================================================================== основной текст
     def _check_body(self, b: Block, list_item: bool = False) -> None:
+        align = self.p.body_align
         self._check_runs(b)
-        self._check_alignment(b, "both", {"both"}, None, "align_body", "indent_body")
+        self._check_alignment(b, align, {align}, None, "align_body", "indent_body")
         if not list_item and not self._is_where_line(b):
-            self._check_alignment(b, "both", {"both", "left", "center", "right"}, INDENT, "align_body", "indent_body")
+            self._check_alignment(b, align, {"both", "left", "center", "right"}, self.indent,
+                                  "align_body", "indent_body")
         self._check_spacing(b)
         if b.in_sources and URL_RE.search(b.text) and "дата обращения" not in b.text.lower():
             self.add("source_access_date", b)
@@ -573,14 +635,19 @@ class Analyzer:
         caps_attr = bool(runs) and all(res.toggle(r, p, "w:caps") for r in runs)
 
         if hk in ("structural", "toc", "appendix"):
-            self._check_alignment(b, "center", {"center"}, 0, "heading_align", "heading_indent")
+            sa = self.p.structural_align
+            self._check_alignment(b, sa, {sa}, 0, "heading_align", "heading_indent")
             if not (typed_upper or caps_attr):
                 self.add("heading_caps", b, fix=lambda: map_text_nodes(p, str.upper))
         else:
-            self._check_alignment(b, "both", {"both"}, INDENT, "heading_align", "heading_indent")
-            if hk == "chapter" and not (typed_upper or caps_attr):
+            ca = self.p.chapter_align
+            self._check_alignment(b, ca, {ca}, self.indent if self.p.chapter_indent else 0,
+                                  "heading_align", "heading_indent")
+            if hk == "chapter" and self.p.chapter_caps and not (typed_upper or caps_attr):
                 self.add("heading_caps", b, fix=lambda: map_text_nodes(p, str.upper))
-            if hk == "sub" and len(letters) > 3 and (typed_upper or caps_attr):
+            if hk == "sub" and self.p.sub_caps and not (typed_upper or caps_attr):
+                self.add("heading_caps", b, fix=lambda: map_text_nodes(p, str.upper))
+            if hk == "sub" and not self.p.sub_caps and len(letters) > 3 and (typed_upper or caps_attr):
                 fix = (lambda: F.caps_off(all_runs)) if caps_attr and not typed_upper else None
                 self.add("heading_not_caps", b, "исправьте регистр вручную" if fix is None else "", fix=fix)
             n = NUM_HEADING_RE.match(" ".join(b.text.split()))
@@ -592,7 +659,7 @@ class Analyzer:
             self.add("heading_end_dot", b, fix=lambda: _remove_trailing_dot(p))
 
         def apply_style(p=p, level=level):
-            F.set_style(p, F.ensure_heading_style(self.doc, level))
+            F.set_style(p, F.ensure_heading_style(self.doc, level, self.p))
 
         if not styled and hk != "toc":
             self.add("heading_style", b, f"нужен стиль «Заголовок {level}»", fix=apply_style)
@@ -606,10 +673,12 @@ class Analyzer:
         p, res = b.el, self.res
         runs = text_runs(p)
         bad = sorted({f"{res.font_name(r, p)} {num_ru(res.font_size(r, p))} пт" for r in runs
-                      if res.font_name(r, p).lower() != R.FONT_NAME.lower() or abs(res.font_size(r, p) - 14) > 0.01})
+                      if res.font_name(r, p).lower() != self.p.font_name.lower()
+                      or abs(res.font_size(r, p) - self.p.font_size) > 0.01})
         if bad:
             all_runs = paragraph_runs(p)
-            self.add("toc_font", b, ", ".join(bad), fix=lambda: F.normalize_runs(all_runs))
+            self.add("toc_font", b, ", ".join(bad),
+                     fix=lambda: F.normalize_runs(all_runs, self.p.font_size, self.p.font_name))
 
     # ================================================================== рисунки
     def _check_picture(self, b: Block) -> None:
@@ -701,7 +770,7 @@ class Analyzer:
             if spans["tail"][1] > spans["tail"][0]:
                 edits.append((spans["tail"], ""))
             if name_ok:
-                good_dash = dash if dash in ("–", "—") else "–"
+                good_dash = dash if dash in ("–", "—") else self.p.caption_dash
                 edits.append((spans["sep"], f" {good_dash} "))
             if renumber or num.endswith("."):
                 edits.append((spans["num"], new_num if renumber else nnum))
@@ -729,14 +798,15 @@ class Analyzer:
         p = b.el
         s = b.text.strip()
         expected = b.expected
-        if not CONT_FULL.match(s):
+        m = CONT_FULL.match(s)
+        if m is None:
+            canonical = f"Продолжение таблицы {expected}" if expected else None
             fix = None
-            if expected:
-                full = len(b.text)
-                fix = lambda: replace_span(p, 0, full, f"Продолжение таблицы {expected}")
+            if canonical and canonical != s:   # без этой проверки правка переписывала текст сама в себя
+                fix = lambda: replace_span(p, 0, len(paragraph_text(p)), canonical)
             self.add("tbl_caption_text", b, "формат: «Продолжение таблицы 1.1»", fix=fix)
             return
-        num = s.rsplit(" ", 1)[-1]
+        num = m.group(1)
         if expected and num != expected:
             start = b.text.rfind(num)
             self.add("tbl_number", b, f"«{num}» → «{expected}» (продолжение последней таблицы)",
@@ -823,7 +893,7 @@ class Analyzer:
         for p in paras:
             for r in text_runs(p):
                 name = res.font_name(r, p)
-                if name.lower() != R.FONT_NAME.lower() and name.lower() not in R.MONOSPACE_FONTS:
+                if name.lower() != self.p.font_name.lower() and name.lower() not in R.MONOSPACE_FONTS:
                     fonts.add(name)
                 c = res.color(r, p)
                 if c:
@@ -838,18 +908,20 @@ class Analyzer:
             parts = sorted(fonts) + sorted(colors) + (["подчёркивание"] if underline else [])
 
             def fix_fonts(all_runs=all_runs):
-                F.set_font_name(all_runs)
+                F.set_font_name(all_runs, self.p.font_name)
                 F.set_black(all_runs)
                 F.remove_underline(all_runs)
             self.add("table_font", b, ", ".join(parts), fix=fix_fonts)
 
         if sizes:
-            bad_sizes = sorted(s for s in sizes if not 12 <= s <= 14)
-            bad_lines = sorted(v for (v, rule) in lines if rule != "auto" or not 1.0 <= v <= 1.5)
+            lo, hi = self.p.table_font_min, self.p.table_font_max
+            lo_line, hi_line = self.p.table_line_min, self.p.table_line_max
+            bad_sizes = sorted(s for s in sizes if not lo <= s <= hi)
+            bad_lines = sorted(v for (v, rule) in lines if rule != "auto" or not lo_line <= v <= hi_line)
             dom_size = sizes.most_common(1)[0][0]
-            dom_line = lines.most_common(1)[0][0] if lines else (1.0, "auto")
-            profile = (min(max(dom_size, 12.0), 14.0),
-                       min(max(dom_line[0], 1.0), 1.5) if dom_line[1] == "auto" else 1.0)
+            dom_line = lines.most_common(1)[0][0] if lines else (lo_line, "auto")
+            profile = (min(max(dom_size, lo), hi),
+                       min(max(dom_line[0], lo_line), hi_line) if dom_line[1] == "auto" else lo_line)
             self.table_profiles.append((b, profile))
             if bad_sizes or bad_lines:
                 detail = []
@@ -859,7 +931,7 @@ class Analyzer:
                     detail.append("интервал " + ", ".join(num_ru(v) for v in bad_lines))
                 self.add("table_size", b, "; ".join(detail), fix=self._table_format_fix(tbl, None))
 
-        if len(rows) >= 2:
+        if len(rows) >= 2 and not (prev is not None and prev.ptype == "CAP_CONT"):
             first_cells = [
                 " ".join(paragraph_text(p) for p in iter_paragraphs(tc)).strip()
                 for tc in rows[0].findall(qn("w:tc"))
@@ -897,6 +969,7 @@ class Analyzer:
     def _check_lists(self) -> None:
         res = self.res
         reported_levels: set[tuple] = set()
+        self._checked_list_numbers: set[int] = set()
         groups: list[list[Block]] = []
         current: list[Block] = []
         current_num = None
@@ -936,7 +1009,7 @@ class Analyzer:
                     marker = lvl_text.get(qn("w:val")) if lvl_text is not None else ""
                     if fmt is not None and fmt.get(qn("w:val")) == "bullet" and marker not in ("–", "—", "-", "−", ""):
                         def fix_marker(lvl=lvl):
-                            set_lvl_child(lvl, "w:lvlText", {"w:val": "–"})
+                            set_lvl_child(lvl, "w:lvlText", {"w:val": self.p.caption_dash})
                             rpr = lvl.find(qn("w:rPr"))
                             if rpr is None:
                                 rpr = OxmlElement("w:rPr")
@@ -946,26 +1019,66 @@ class Analyzer:
                                 rf = OxmlElement("w:rFonts")
                                 rpr.insert(0, rf)
                             for attr in ("ascii", "hAnsi", "cs"):
-                                rf.set(qn(f"w:{attr}"), R.FONT_NAME)
+                                rf.set(qn(f"w:{attr}"), self.p.font_name)
                             rf.attrib.pop(qn("w:hint"), None)
                         shown = "".join(
                             _SYMBOL_CHARS.get(f"{ord(ch):X}"[-2:], "?") if 0xF000 <= ord(ch) <= 0xF0FF else ch
                             for ch in marker
                         )
                         self.add("list_marker", b, f"сейчас «{shown or '?'}»", fix=fix_marker)
+                self._check_list_number(b, group, lvl)
                 if ilvl == 0:
                     left, first_line, _ = res.indent(b.el)
-                    if abs(left) > TOL or abs(first_line - INDENT) > TOL:
+                    if abs(left) > TOL or abs(first_line - self.indent) > TOL:
                         bad_indent.append((b, left, first_line))
             if bad_indent:
                 b0, left, first_line = bad_indent[0]
                 items = [b for b, _, _ in bad_indent]
                 self.add(
                     "list_indent", b0,
-                    f"номер на {cm(left + first_line)}, текст с {cm(left)}; нужно 1,25 см и 0 см"
+                    f"номер на {cm(left + first_line)}, текст с {cm(left)}; "
+                    f"нужно {cm(self.indent)} и 0 см"
                     + (f" (пунктов: {len(items)})" if len(items) > 1 else ""),
-                    fix=lambda items=items: [F.set_indent(x.el, INDENT, 0, 0) for x in items],
+                    fix=lambda items=items: [F.set_indent(x.el, self.indent, 0, 0) for x in items],
                 )
+
+    def _check_list_number(self, b: Block, group: list[Block], lvl) -> None:
+        """Номер/маркер перечисления оформляется знаком абзаца — сам текст пункта его не задаёт."""
+        if id(lvl) in self._checked_list_numbers:
+            return
+        self._checked_list_numbers.add(id(lvl))
+        res, p = self.res, b.el
+        lvl_rpr = lvl.find(qn("w:rPr"))
+        chain = ([lvl_rpr] if lvl_rpr is not None else []) + res.mark_chain(p)
+        runs = text_runs(p)
+        text_bold = bool(runs) and all(res.toggle(r, p, "w:b") for r in runs)
+        fmt = lvl.find(qn("w:numFmt"))
+        lvl_text = lvl.find(qn("w:lvlText"))
+        marker = (lvl_text.get(qn("w:val")) or "") if lvl_text is not None else ""
+        # маркер-символ (например, тире из шрифта Symbol) рисуется своим шрифтом — это не ошибка
+        symbol_marker = (fmt is not None and fmt.get(qn("w:val")) == "bullet"
+                         and bool(marker) and 0xF000 <= ord(marker[0]) <= 0xF0FF)
+        name, size = res.font_name_in(chain), res.font_size_in(chain)
+        color, bold = res.color_in(chain), res.toggle_in(chain, "w:b")
+        problems = []
+        if not symbol_marker and name.strip().lower() != self.p.font_name.lower():
+            problems.append(name)
+        if abs(size - self.p.font_size) > 0.01:
+            problems.append(f"{num_ru(size)} пт")
+        if color:
+            problems.append(color)
+        if bold and not text_bold:
+            problems.append("полужирный")
+        if not problems:
+            return
+
+        def fix_numbers(items=list(group), lvl=lvl, text_bold=text_bold, symbol_marker=symbol_marker):
+            for item in items:
+                F.normalize_paragraph_mark(item.el, self.p, bold=text_bold)
+            F.normalize_numbering_level(lvl, self.p, set_font=not symbol_marker)
+
+        self.add("list_number_format", b, ", ".join(problems)
+                 + (f" (пунктов: {len(group)})" if len(group) > 1 else ""), fix=fix_numbers)
 
     # ================================================================== ссылки
     def _ref_paragraphs(self):
@@ -1081,7 +1194,9 @@ class Analyzer:
                 continue  # раздел целиком состоит из титульного листа/задания
             where = f"раздел документа {i}" if many else "параметры страницы"
             wrong = []
-            for side, target in R.MARGINS_MM.items():
+            margins = {"left": self.p.margin_left_mm, "right": self.p.margin_right_mm,
+                       "top": self.p.margin_top_mm, "bottom": self.p.margin_bottom_mm}
+            for side, target in margins.items():
                 value = getattr(s, f"{side}_margin")
                 if value is None or abs(value.mm - target) > R.MARGIN_TOLERANCE_MM:
                     names = {"left": "левое", "right": "правое", "top": "верхнее", "bottom": "нижнее"}
@@ -1089,18 +1204,19 @@ class Analyzer:
                     wrong.append(f"{names[side]} {cur} мм (нужно {target:.0f})")
             if wrong:
                 def fix_margins(s=s):
-                    s.left_margin, s.right_margin = Mm(30), Mm(15)
-                    s.top_margin, s.bottom_margin = Mm(20), Mm(20)
+                    s.left_margin, s.right_margin = Mm(self.p.margin_left_mm), Mm(self.p.margin_right_mm)
+                    s.top_margin, s.bottom_margin = Mm(self.p.margin_top_mm), Mm(self.p.margin_bottom_mm)
                 self.add("margins", None, "; ".join(wrong), fix=fix_margins, where=where, anchor=anchor)
             hf = []
             for attr, label in (("header_distance", "верхний"), ("footer_distance", "нижний")):
                 value = getattr(s, attr)
-                if value is None or abs(value.cm - R.HEADER_FOOTER_DISTANCE_CM) > 0.03:
+                if value is None or abs(value.cm - self.p.hf_distance_cm) > 0.03:
                     hf.append(f"{label} {num_ru(round(value.cm, 2)) if value is not None else '?'} см")
             if hf:
                 def fix_hf(s=s):
-                    s.header_distance = s.footer_distance = Cm(R.HEADER_FOOTER_DISTANCE_CM)
-                self.add("hf_distance", None, "; ".join(hf) + " (нужно 1,25 см)", fix=fix_hf, where=where, anchor=anchor)
+                    s.header_distance = s.footer_distance = Cm(self.p.hf_distance_cm)
+                self.add("hf_distance", None, "; ".join(hf) + f" (нужно {num_ru(self.p.hf_distance_cm)} см)",
+                         fix=fix_hf, where=where, anchor=anchor)
 
     def _check_page_numbers(self) -> None:
         anchor = self._first_anchor()
@@ -1145,7 +1261,7 @@ class Analyzer:
                     self.add("footer_empty", None, f"пустых строк: {len(empties) + len(brs)}", fix=remove_blank,
                              where=f"нижний колонтитул (раздел {i})", anchor=anchor)
         if not found_any:
-            self.add("page_numbers_missing", None, fix=lambda: F.add_page_numbers(self.doc),
+            self.add("page_numbers_missing", None, fix=lambda: F.add_page_numbers(self.doc, self.p),
                      where="весь документ", anchor=anchor)
 
     def _check_page_number_paragraph(self, p, section_no: int, anchor) -> None:
@@ -1161,8 +1277,8 @@ class Analyzer:
             problems.append(f"отступ {cm(first)}")
         runs = [r for r in paragraph_runs(p)]
         bad_font = {f"{res.font_name(r, p)} {num_ru(res.font_size(r, p))} пт" for r in runs
-                    if run_has_content(r) and (res.font_name(r, p).lower() != R.FONT_NAME.lower()
-                                               or abs(res.font_size(r, p) - 14) > 0.01)}
+                    if run_has_content(r) and (res.font_name(r, p).lower() != self.p.font_name.lower()
+                                               or abs(res.font_size(r, p) - self.p.font_size) > 0.01)}
         if bad_font:
             problems.append("шрифт " + ", ".join(sorted(bad_font)))
         if problems:
@@ -1171,8 +1287,8 @@ class Analyzer:
                     replace_span(p, 0, leading_tabs, "")
                 F.set_alignment(p, "center")
                 F.set_indent(p, 0, 0, 0)
-                F.set_font_name(runs)
-                F.set_font_size(runs, R.FONT_SIZE_PT)
+                F.set_font_name(runs, self.p.font_name)
+                F.set_font_size(runs, self.p.font_size)
             self.add("page_number_format", None, "; ".join(problems), fix=fix,
                      where=f"нижний колонтитул (раздел {section_no})", anchor=anchor)
 

@@ -12,6 +12,7 @@ class StoredFile:
     data: bytes
     filename: str
     user_id: int
+    title_pages: int | None = None      # сколько первых страниц пропустить (None — определить автоматически)
     created: float = field(default_factory=time.monotonic)
 
 
@@ -34,6 +35,15 @@ class FileStore:
         self._cleanup()
         item = self._items.get(key)
         return item if item is not None and item.user_id == user_id else None
+
+    def get_any(self, key: str) -> StoredFile | None:
+        self._cleanup()
+        return self._items.get(key)
+
+    def set_title_pages(self, key: str, pages: int | None) -> None:
+        item = self._items.get(key)
+        if item is not None:
+            item.title_pages = pages
 
     def _cleanup(self) -> None:
         now = time.monotonic()

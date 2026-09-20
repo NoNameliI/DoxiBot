@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .rules import ERROR, RULES, Rule
+from .profile import DEFAULT, Profile
+from .rules import ERROR, RULES, Rule, hint_for, title_for
 
 
 @dataclass
@@ -18,6 +19,12 @@ class Issue:
     def rule(self) -> Rule:
         return RULES[self.code]
 
+    def title(self, profile: Profile = DEFAULT) -> str:
+        return title_for(self.code, profile)
+
+    def hint(self, profile: Profile = DEFAULT) -> str:
+        return hint_for(self.code, profile)
+
     @property
     def is_error(self) -> bool:
         return self.rule.severity == ERROR
@@ -29,6 +36,7 @@ class Issue:
 
 @dataclass
 class Analysis:
+    profile: Profile = DEFAULT
     issues: list[Issue] = field(default_factory=list)
     stats: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)

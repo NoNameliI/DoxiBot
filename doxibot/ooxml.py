@@ -543,13 +543,24 @@ class Resolver:
             chain.append(self.def_rpr)
         return chain
 
+    def mark_chain(self, p) -> list:
+        """Цепочка rPr знака абзаца — от неё Word берёт формат номера/маркера перечисления."""
+        chain = []
+        ppr = p.find(qn("w:pPr"))
+        if ppr is not None and ppr.find(qn("w:rPr")) is not None:
+            chain.append(ppr.find(qn("w:rPr")))
+        for st in self.style_chain(self.pstyle_id(p)):
+            if st.find(qn("w:rPr")) is not None:
+                chain.append(st.find(qn("w:rPr")))
+        if self.def_rpr is not None:
+            chain.append(self.def_rpr)
+        return chain
+
     def _theme_font(self, theme: str) -> str:
         return self.theme_major if theme.startswith("major") else self.theme_minor
 
-    def font_name(self, r, p) -> str:
-        text = run_text(r)
-        which = "hAnsi" if any(ord(c) > 127 for c in text) else "ascii"
-        for rpr in self._rpr_chain(r, p):
+    def font_name_in(self, chain: list, which: str = "hAnsi") -> str:
+        for rpr in chain:
             rf = rpr.find(qn("w:rFonts"))
             if rf is None:
                 continue
@@ -561,19 +572,41 @@ class Resolver:
                 return name
         return "Times New Roman"
 
-    def font_size(self, r, p) -> float:
-        for rpr in self._rpr_chain(r, p):
+    def font_name(self, r, p) -> str:
+        which = "hAnsi" if any(ord(c) > 127 for c in run_text(r)) else "ascii"
+        return self.font_name_in(self._rpr_chain(r, p), which)
+
+    def font_size_in(self, chain: list) -> float:
+        for rpr in chain:
             sz = rpr.find(qn("w:sz"))
             if sz is not None and sz.get(qn("w:val")):
                 return _int(sz.get(qn("w:val"))) / 2
         return 10.0
 
-    def toggle(self, r, p, tag: str) -> bool:
-        for rpr in self._rpr_chain(r, p):
+    def toggle_in(self, chain: list, tag: str) -> bool:
+        for rpr in chain:
             el = rpr.find(qn(tag))
             if el is not None:
                 return _toggle_value(el)
         return False
+
+    def color_in(self, chain: list) -> str | None:
+        for rpr in chain:
+            c = rpr.find(qn("w:color"))
+            if c is None:
+                continue
+            theme = c.get(qn("w:themeColor"))
+            if theme:
+                return None if theme in ("text1", "dark1") else f"цвет темы «{theme}»"
+            val = (c.get(qn("w:val")) or "auto").upper()
+            return None if val in ("AUTO", "000000") else f"#{val}"
+        return None
+
+    def font_size(self, r, p) -> float:
+        return self.font_size_in(self._rpr_chain(r, p))
+
+    def toggle(self, r, p, tag: str) -> bool:
+        return self.toggle_in(self._rpr_chain(r, p), tag)
 
     def underline(self, r, p) -> bool:
         for rpr in self._rpr_chain(r, p):
@@ -584,18 +617,7 @@ class Resolver:
 
     def color(self, r, p) -> str | None:
         """None — цвет чёрный/авто, иначе строка с описанием цвета."""
-        for rpr in self._rpr_chain(r, p):
-            c = rpr.find(qn("w:color"))
-            if c is None:
-                continue
-            theme = c.get(qn("w:themeColor"))
-            if theme:
-                return None if theme in ("text1", "dark1") else f"цвет темы «{theme}»"
-            val = (c.get(qn("w:val")) or "auto").upper()
-            if val in ("AUTO", "000000"):
-                return None
-            return f"#{val}"
-        return None
+        return self.color_in(self._rpr_chain(r, p))
 
 
 # --- Утилиты форматирования чисел ------------------------------------------------------------

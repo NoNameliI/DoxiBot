@@ -15,6 +15,7 @@ from docx.text.run import Run
 from . import fixes as F
 from .analyzer import Analyzer
 from .model import Analysis
+from .profile import DEFAULT, Profile
 
 log = logging.getLogger(__name__)
 
@@ -41,8 +42,8 @@ def _save(document) -> bytes:
     return out.getvalue()
 
 
-def check(data: bytes) -> Analysis:
-    return Analyzer(_load(data)).run()
+def check(data: bytes, profile: Profile = DEFAULT, title_pages: int | None = None) -> Analysis:
+    return Analyzer(_load(data), profile, title_pages).run()
 
 
 @dataclass
@@ -82,37 +83,48 @@ def _apply(analysis: Analysis) -> tuple[int, int, bool]:
     return applied, failed, changed_text
 
 
-def fix(data: bytes, max_passes: int = 3) -> FixResult:
+def fix(data: bytes, profile: Profile = DEFAULT, title_pages: int | None = None,
+        max_passes: int = 4) -> FixResult:
     """Применяет автоисправления. Несколько проходов: одно исправление (например, смена стиля
-    заголовка) может открыть мелкие несоответствия, которые снимает следующий проход."""
+    заголовка) может открыть мелкие несоответствия, которые снимает следующий проход. Если набор
+    замечаний между проходами перестал меняться — останавливаемся, чтобы не крутиться вхолостую."""
     document = _load(data)
     before = None
     applied = failed = 0
     changed_text = has_toc = False
+    previous: set | None = None
     for pass_no in range(max_passes):
-        analyzer = Analyzer(document)
+        analyzer = Analyzer(document, profile, title_pages)
         analysis = analyzer.run()
         if before is None:
             before = analysis
         has_toc = has_toc or analyzer.has_toc_field
+        signature = {(i.code, i.where, i.detail) for i in analysis.issues if i.fixable}
+        if not signature:
+            break
+        if signature == previous:
+            log.warning("Исправления не меняют документ, останавливаюсь: %s",
+                        sorted({code for code, _, _ in signature})[:5])
+            break
+        previous = signature
         n_applied, n_failed, changed = _apply(analysis)
         if pass_no == 0:
             applied, failed = n_applied, n_failed
         changed_text = changed_text or changed
-        F.normalize_styles(document)
+        F.normalize_styles(document, profile)
         if n_applied == 0:
             break
     if has_toc and changed_text:
         F.request_fields_update(document)
     result = _save(document)
-    after = check(result)
+    after = check(result, profile, title_pages)
     return FixResult(result, before, after, applied, failed)
 
 
-def annotate(data: bytes) -> tuple[bytes, Analysis]:
+def annotate(data: bytes, profile: Profile = DEFAULT, title_pages: int | None = None) -> tuple[bytes, Analysis]:
     """Копия документа с примечаниями Word на абзацах, где найдены ошибки."""
     document = _load(data)
-    analysis = Analyzer(document).run()
+    analysis = Analyzer(document, profile, title_pages).run()
     body = document.element.body
     groups: OrderedDict[int, tuple[object, list]] = OrderedDict()
     for issue in analysis.issues:
@@ -129,14 +141,14 @@ def annotate(data: bytes) -> tuple[bytes, Analysis]:
         lines, seen = [], set()
         for issue in issues:
             mark = "✖" if issue.is_error else "⚠"
-            line = f"{mark} {issue.rule.title}"
+            line = f"{mark} {issue.title(analysis.profile)}"
             if issue.detail:
                 line += f": {issue.detail}"
             if line in seen:
                 continue
             seen.add(line)
             lines.append(line)
-            lines.append(f"   → {issue.rule.hint}")
+            lines.append(f"   → {issue.hint(analysis.profile)}")
         try:
             document.add_comment(runs=[runs[0], runs[-1]], text="\n".join(lines[:30]),
                                  author="DoxiBot", initials="DB")

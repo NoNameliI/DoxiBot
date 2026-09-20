@@ -53,12 +53,11 @@ def summary_header(analysis: Analysis, filename: str) -> str:
     return "\n".join(lines)
 
 
-def _group_html(code: str, issues: list[Issue], limit: int) -> str:
+def _group_html(code: str, issues: list[Issue], limit: int, profile) -> str:
     first = issues[0]
-    rule = first.rule
     icon = "❌" if first.is_error else "⚠️"
     fix_mark = " 🛠" if all(i.fixable for i in issues) else (" 🛠½" if any(i.fixable for i in issues) else "")
-    head = f"{icon} <b>{escape(rule.title)}</b> — {len(issues)}{fix_mark}"
+    head = f"{icon} <b>{escape(first.title(profile))}</b> — {len(issues)}{fix_mark}"
     body = []
     for issue in issues[:limit]:
         line = f"• {escape(issue.where)}"
@@ -68,7 +67,7 @@ def _group_html(code: str, issues: list[Issue], limit: int) -> str:
     if len(issues) > limit:
         rest = len(issues) - limit
         body.append(f"…и ещё {rest} {_plural(rest, 'место', 'места', 'мест')}")
-    body.append(f"💡 {escape(rule.hint)}")
+    body.append(f"💡 {escape(first.hint(profile))}")
     return f"{head}\n<blockquote expandable>" + "\n".join(body) + "</blockquote>"
 
 
@@ -79,7 +78,7 @@ def chat_messages(analysis: Analysis, filename: str) -> tuple[list[str], bool]:
     current = summary_header(analysis, filename)
     groups = group_issues(analysis.issues)
     for n, (code, issues) in enumerate(groups):
-        block = _group_html(code, issues, EXAMPLES_IN_CHAT)
+        block = _group_html(code, issues, EXAMPLES_IN_CHAT, analysis.profile)
         truncated = truncated or len(issues) > EXAMPLES_IN_CHAT
         if len(current) + len(block) + 2 > TG_LIMIT:
             messages.append(current)
@@ -105,11 +104,10 @@ def full_text_report(analysis: Analysis, filename: str) -> str:
     for note in analysis.notes:
         out.append(f"* {note}")
     for code, issues in group_issues(analysis.issues):
-        rule = issues[0].rule
         kind = "ОШИБКА" if issues[0].is_error else "ЗАМЕЧАНИЕ"
         out.append("=" * 70)
-        out.append(f"[{kind}] {rule.title} — {len(issues)}")
-        out.append(f"Как исправить: {rule.hint}")
+        out.append(f"[{kind}] {issues[0].title(analysis.profile)} — {len(issues)}")
+        out.append(f"Как исправить: {issues[0].hint(analysis.profile)}")
         out.append("-" * 70)
         for n, issue in enumerate(issues, 1):
             line = f"{n:>3}. {issue.where}"
@@ -135,7 +133,7 @@ def fix_summary(applied: int, failed: int, after: Analysis) -> str:
         )
         for code, issues in group_issues(remaining)[:12]:
             icon = "❌" if issues[0].is_error else "⚠️"
-            lines.append(f"{icon} {escape(issues[0].rule.title)} — {len(issues)}")
+            lines.append(f"{icon} {escape(issues[0].title(after.profile))} — {len(issues)}")
         if len(group_issues(remaining)) > 12:
             lines.append("…")
     lines.append("\n<i>Меняется только оформление, регистр заголовков и номера подписей (ссылки на них "

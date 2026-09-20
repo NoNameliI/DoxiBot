@@ -1,4 +1,4 @@
-"""DoxiBot — Telegram-бот проверки оформления DOCX по требованиям ККСО-XX-24.
+"""DoxiBot — Telegram-бот проверки оформления DOCX по стандартным требованиям.
 
 Запуск:  python bot.py   (токен берётся из .env → BOT_TOKEN)
 """
@@ -12,17 +12,20 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
-from doxibot.config import load_config
+from doxibot.config import ROOT, load_config
 from doxibot.handlers import router, setup_workers
+from doxibot.profile import SettingsStore
 from doxibot.storage import FileStore
 
 BOT_NAME = "DoxiBot"
 DESCRIPTION = (
-    "DoxiBot проверяет оформление отчётов .docx по требованиям ККСО-XX-24: поля, шрифты, интервалы, "
+    "DoxiBot проверяет оформление отчётов .docx по стандартным требованиям: поля, шрифты, интервалы, "
     "заголовки, рисунки, таблицы, формулы, перечисления и нумерацию страниц. Показывает ошибки, "
-    "исправляет их автоматически и расставляет примечания в документе.\n\nПросто пришлите файл .docx."
+    "исправляет их автоматически и расставляет примечания в документе. Свои требования — /settings."
+    "\n\nПросто пришлите файл .docx."
 )
 SHORT_DESCRIPTION = "Проверка и автоисправление оформления отчётов .docx"
 
@@ -31,7 +34,8 @@ async def on_startup(bot: Bot) -> None:
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="Начать"),
-            BotCommand(command="rules", description="Требования к оформлению"),
+            BotCommand(command="settings", description="Свои требования к оформлению"),
+            BotCommand(command="rules", description="По каким правилам проверяю"),
             BotCommand(command="help", description="Что проверяет бот"),
         ])
         if (await bot.get_my_name()).name != BOT_NAME:
@@ -51,7 +55,12 @@ async def main() -> None:
     config = load_config()
     setup_workers(config.workers)
     bot = Bot(config.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(store=FileStore(config.store_ttl_minutes), max_file_mb=config.max_file_mb)
+    dp = Dispatcher(
+        storage=MemoryStorage(),
+        store=FileStore(config.store_ttl_minutes),
+        settings=SettingsStore(ROOT / "data" / "settings.json"),
+        max_file_mb=config.max_file_mb,
+    )
     dp.include_router(router)
     dp.startup.register(on_startup)
     await bot.delete_webhook(drop_pending_updates=True)
